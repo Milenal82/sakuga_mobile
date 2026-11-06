@@ -13,21 +13,17 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # 1. 获取 Sakuga Mobile 的 Android 分支
+      # 1. 获取自己的 Sakuga Mobile 仓库
       - name: Checkout Sakuga Mobile
         uses: actions/checkout@v4
-        with:
-          repository: Bryancm/sakuga_mobile
-          ref: android
-          persist-credentials: false
 
-      # 2. Node.js 16，兼容 React Native 0.64.1
+      # 2. Node.js 16
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '16.20.2'
 
-      # 3. JDK 17，用于安装 Android SDK
+      # 3. JDK 17 用于安装 Android SDK
       - name: Setup Java 17
         uses: actions/setup-java@v5
         with:
@@ -35,13 +31,12 @@ jobs:
           java-version: '17'
 
       # 4. 初始化 Android SDK
-      # 避免安装已经失效的 tools 包
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools'
 
-      # 5. 安装 Android 30 和旧版 NDK
+      # 5. 安装 Android SDK 30 和 NDK
       - name: Install Android SDK components
         run: |
           sdkmanager \
@@ -56,14 +51,14 @@ jobs:
           distribution: temurin
           java-version: '11'
 
-      # 7. 安装 Yarn 和 JavaScript 依赖
+      # 7. 安装 JavaScript 依赖
       - name: Install JavaScript dependencies
         run: |
           npm install --global yarn@1.22.22
           yarn install --network-timeout 600000
 
-      # 8. 修复旧版 Android 依赖仓库
-      - name: Fix legacy Maven repositories
+      # 8. 配置旧版 Maven 镜像
+      - name: Configure legacy Maven mirrors
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -71,16 +66,16 @@ jobs:
           path = Path("android/build.gradle")
           content = path.read_text()
 
-          # Maven Central 优先于 JCenter
-          content = content.replace(
-              "        jcenter()",
-              "        mavenCentral()\n        jcenter()"
-          )
-
-          # 为旧版视频依赖添加候选仓库
-          marker = "        maven { url 'https://www.jitpack.io' }"
-
-          extra = """
+          mirrors = """
+                  maven {
+                      url "https://maven.aliyun.com/repository/jcenter"
+                  }
+                  maven {
+                      url "https://maven.aliyun.com/repository/public"
+                  }
+                  maven {
+                      url "https://maven.aliyun.com/repository/central"
+                  }
                   maven {
                       url "https://repository.mulesoft.org/nexus/content/repositories/public/"
                   }
@@ -89,25 +84,255 @@ jobs:
                   }
           """
 
-          if marker in content:
-              content = content.replace(
-                  marker,
-                  extra + marker
-              )
-          else:
+          content = content.replace(
+              "        jcenter()",
+              "        mavenCentral()\n" + mirrors + "\n        jcenter()"
+          )
+
+          path.write_text(content)
+          print("Maven mirrors configured")
+          PY
+
+      # 9. 关闭 Flipper 调试组件
+      - name: Disable Flipper debugging
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          app_path = Path("android/app/build.gradle")
+          content = app_path.read_text()
+
+          pattern = (
+              r'(?ms)^[ \t]*debugImplementation'
+              r'\("com\.facebook\.flipper:[^\n]*\)'
+              r'[ \t]*\{.*?^[ \t]*\}[ \t]*\n'
+          )
+
+          content, count = re.subn(pattern, "", content)
+
+          if count != 3:
               raise RuntimeError(
-                  "Cannot find JitPack repository marker"
+                  f"Expected 3 Flipper dependencies, found {count}"
+              )
+
+          app_path.write_text(content)
+
+          flipper = Path(
+              "android/app/src/debug/java/"
+              "com/sakugamobile/ReactNativeFlipper.java"
+          )
+
+          if flipper.exists():
+              flipper.unlink()
+
+          main = Path(
+              "android/app/src/main/java/"
+              "com/sakugamobile/MainApplication.java"
+          )
+
+          if main.exists():
+              text = main.read_text()
+              text = text.replace(
+                  "        initializeFlipper(this, "
+                  "getReactNativeHost().getReactInstanceManager());",
+                  ""
+              )
+              main.write_text(text)
+
+          print("Flipper debugging disabled")
+          PY
+
+      # 10. 恢复旧版 Android Maven 依赖
+      - name: Recover legacy Android dependencies
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          import zipfile
+
+          repositories = [
+              "https://maven.aliyun.com/repository/jcenter/",
+              "https://maven.aliyun.com/repository/public/",
+              "https://maven.aliyun.com/repository/central/",
+              "https://repo.maven.apache.org/maven2/",
+              "https://repository.mulesoft.org/nexus/content/repositories/public/",
+              "https://maven.wso2.org/nexus/content/repositories/public/",
+          ]
+
+          dependencies = [
+              ("com.facebook.fresco", "fresco", "2.2.0"),
+              ("com.facebook.fresco", "imagepipeline", "2.2.0"),
+              ("com.facebook.fresco", "fbcore", "2.2.0"),
+              ("com.arthenica", "mobile-ffmpeg-https", "4.4.LTS"),
+              ("com.yqritc", "android-scalablevideoview", "1.0.4"),
+              ("com.danikula", "videocache", "2.7.1"),
+          ]
+
+          local_repo = Path.home() / ".m2" / "repository"
+
+          def download(url, output):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "SakugaMobile-Android-Build/1.0"
+                  }
+              )
+
+              temp = output.with_suffix(output.suffix + ".part")
+
+              try:
+                  with urllib.request.urlopen(
+                      request, timeout=25
+                  ) as response:
+                      with open(temp, "wb") as file:
+                          while True:
+                              chunk = response.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              file.write(chunk)
+
+                  if temp.stat().st_size == 0:
+                      raise ValueError("Empty download")
+
+                  if output.suffix in (".aar", ".jar"):
+                      if not zipfile.is_zipfile(temp):
+                          raise ValueError("Invalid archive")
+
+                  if output.suffix == ".pom":
+                      ET.parse(temp)
+
+                  temp.replace(output)
+                  return True
+
+              except Exception as error:
+                  print(
+                      f"Not available: "
+                      f"{type(error).__name__}: {url}",
+                      flush=True
+                  )
+                  temp.unlink(missing_ok=True)
+                  return False
+
+          def restore(group, artifact, version):
+              relative = (
+                  group.replace(".", "/")
+                  + "/" + artifact
+                  + "/" + version + "/"
+              )
+
+              folder = local_repo / relative
+              folder.mkdir(parents=True, exist_ok=True)
+
+              pom_name = f"{artifact}-{version}.pom"
+              pom = folder / pom_name
+
+              selected = None
+
+              for base in repositories:
+                  if download(base + relative + pom_name, pom):
+                      selected = base
+                      break
+
+              if selected is None:
+                  return False
+
+              root = ET.parse(pom).getroot()
+
+              packaging = root.findtext(
+                  "{http://maven.apache.org/POM/4.0.0}packaging"
+              )
+
+              if packaging is None:
+                  packaging = root.findtext("packaging")
+
+              if not packaging:
+                  packaging = "jar"
+
+              packaging = packaging.strip()
+
+              if packaging == "pom":
+                  print(f"RESTORED POM: {artifact}:{version}")
+                  return True
+
+              if packaging not in ("aar", "jar"):
+                  print(f"Unsupported packaging: {packaging}")
+                  return False
+
+              filename = f"{artifact}-{version}.{packaging}"
+              destination = folder / filename
+
+              for base in [selected] + [
+                  x for x in repositories if x != selected
+              ]:
+                  if download(
+                      base + relative + filename,
+                      destination
+                  ):
+                      print(
+                          f"RESTORED: {group}:{artifact}:{version}"
+                          f" from {base}",
+                          flush=True
+                      )
+                      return True
+
+              pom.unlink(missing_ok=True)
+              return False
+
+          missing = []
+
+          for group, artifact, version in dependencies:
+              print(
+                  f"\nChecking {group}:{artifact}:{version}",
+                  flush=True
+              )
+
+              if not restore(group, artifact, version):
+                  missing.append(f"{group}:{artifact}:{version}")
+
+          if missing:
+              print("\nMISSING ORIGINAL DEPENDENCIES:")
+              for item in missing:
+                  print(" - " + item)
+
+              raise SystemExit(
+                  "Some original Android libraries are unavailable."
+              )
+
+          print("\nCore legacy dependencies restored.")
+          PY
+
+      # 11. 将 JavaScript 打包进 Debug APK
+      - name: Enable JavaScript bundling
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("android/app/build.gradle")
+          content = path.read_text()
+
+          pattern = r"(?m)^(project\.ext\.react = \[\s*\n)"
+
+          content, count = re.subn(
+              pattern,
+              r"\g<1>        bundleInDebug: true,\n",
+              content,
+              count=1
+          )
+
+          if count != 1:
+              raise RuntimeError(
+                  "Cannot find React Native configuration"
               )
 
           path.write_text(content)
-
-          print("Updated Android Maven repositories:")
-          print(content)
+          print("JavaScript bundling enabled")
           PY
 
-      # 9. 把 JavaScript 打包到 Debug APK
-      # 安装后不需要连接 Metro 开发服务器
-      - name: Enable JavaScript bundling
+      # 12. 固定 React Native 0.64.1
+      - name: Pin React Native Android dependency
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -115,26 +340,47 @@ jobs:
           path = Path("android/app/build.gradle")
           content = path.read_text()
 
-          # 只修改实际配置，避免修改注释中的示例
-          old = """project.ext.react = [
-              enableHermes: true,"""
-
-          new = """project.ext.react = [
-              bundleInDebug: true,
-              enableHermes: true,"""
+          old = 'implementation "com.facebook.react:react-native:+"'
+          new = 'implementation "com.facebook.react:react-native:0.64.1"'
 
           if old not in content:
               raise RuntimeError(
-                  "Cannot locate React Native configuration"
+                  "Cannot find dynamic React Native dependency"
               )
 
           content = content.replace(old, new, 1)
           path.write_text(content)
 
-          print("Enabled JavaScript bundling")
+          print("React Native dependency pinned to 0.64.1")
           PY
 
-      # 10. 检查构建环境
+      # 13. 全局强制 React Native 0.64.1
+      - name: Force React Native 0.64.1 globally
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("android/build.gradle")
+          content = path.read_text()
+
+          rule = """
+          allprojects {
+              configurations.all {
+                  resolutionStrategy {
+                      force 'com.facebook.react:react-native:0.64.1'
+                  }
+              }
+          }
+          """
+
+          if "force 'com.facebook.react:react-native:0.64.1'" not in content:
+              content += "\n" + rule
+
+          path.write_text(content)
+          print("React Native 0.64.1 forced across all projects")
+          PY
+
+      # 14. 检查构建环境
       - name: Check build environment
         working-directory: android
         run: |
@@ -143,76 +389,21 @@ jobs:
           chmod +x gradlew
           ./gradlew --version
 
-      # 11. 编译 Sakuga Mobile APK
-      
-      - name: Diagnose missing Android dependencies
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import urllib.request
-          import urllib.error
-
-          artifacts = {
-              "Fresco 2.2.0":
-                  "com/facebook/fresco/fresco/2.2.0/fresco-2.2.0.pom",
-              "Mobile FFmpeg 4.4.LTS":
-                  "com/arthenica/mobile-ffmpeg-https/4.4.LTS/mobile-ffmpeg-https-4.4.LTS.pom",
-              "ScalableVideoView 1.0.4":
-                  "com/yqritc/android-scalablevideoview/1.0.4/android-scalablevideoview-1.0.4.pom",
-              "VideoCache 2.7.1":
-                  "com/danikula/videocache/2.7.1/videocache-2.7.1.pom"
-          }
-
-          repositories = {
-              "Maven Central":
-                  "https://repo.maven.apache.org/maven2/",
-              "Mulesoft":
-                  "https://repository.mulesoft.org/nexus/content/repositories/public/",
-              "WSO2":
-                  "https://maven.wso2.org/nexus/content/repositories/public/",
-              "JCenter":
-                  "https://jcenter.bintray.com/"
-          }
-
-          for name, path in artifacts.items():
-              print(f"\n===== {name} =====", flush=True)
-              found = False
-
-              for repo_name, base_url in repositories.items():
-                  url = base_url + path
-                  try:
-                      req = urllib.request.Request(
-                          url,
-                          headers={"User-Agent": "Mozilla/5.0"}
-                      )
-                      with urllib.request.urlopen(req, timeout=12) as response:
-                          status = response.status
-                          if status == 200:
-                              print(f"FOUND: {repo_name} - {url}")
-                              found = True
-                              break
-                  except Exception as e:
-                      print(f"Unavailable: {repo_name} - {type(e).__name__}")
-
-              if not found:
-                  print(f"MISSING: {name}")
-          PY
-
+      # 15. 编译 Sakuga Mobile APK
       - name: Build Sakuga Mobile APK
         working-directory: android
         run: |
           ./gradlew assembleDebug \
             --no-daemon \
-            --stacktrace \
-            --refresh-dependencies
+            --stacktrace
 
-      # 12. 验证 APK 是否生成
+      # 16. 检查 APK
       - name: Verify APK
         run: |
-          test -s android/app/build/outputs/apk/debug/app-debug.apk
           ls -lh android/app/build/outputs/apk/debug/
+          test -s android/app/build/outputs/apk/debug/app-debug.apk
 
-      # 13. 上传 APK
+      # 17. 上传 APK
       - name: Upload Sakuga Mobile APK
         uses: actions/upload-artifact@v4
         with:
